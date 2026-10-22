@@ -20,6 +20,8 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -438,6 +440,17 @@ class MainActivity : ComponentActivity() {
                                     },
                                     "ZenTubeBridge"
                                 )
+
+                                try {
+                                    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                                        WebViewCompat.addDocumentStartJavaScript(
+                                            this,
+                                            AdBlockEngine.ADBLOCK_INJECTION_SCRIPT,
+                                            setOf("*")
+                                        )
+                                    }
+                                } catch (e: Exception) {}
+
                                 webViewClient = object : WebViewClient() {
                                     override fun shouldInterceptRequest(
                                         view: WebView?,
@@ -456,6 +469,9 @@ class MainActivity : ComponentActivity() {
                                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                         super.onPageStarted(view, url, favicon)
                                         isPageLoading = true
+                                        if (isAdBlockEnabled.value) {
+                                            view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
+                                        }
                                     }
 
                                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -466,11 +482,22 @@ class MainActivity : ComponentActivity() {
                                             view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
                                         }
                                     }
+
+                                    override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                                        super.doUpdateVisitedHistory(view, url, isReload)
+                                        canGoBack = view?.canGoBack() == true
+                                        if (isAdBlockEnabled.value) {
+                                            view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
+                                        }
+                                    }
                                 }
 
                                 webChromeClient = object : WebChromeClient() {
                                     override fun onProgressChanged(view: WebView?, newProgress: Int) {
                                         pageProgress = newProgress / 100f
+                                        if (newProgress in 20..90 && isAdBlockEnabled.value) {
+                                            view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
+                                        }
                                         if (newProgress >= 100) {
                                             isPageLoading = false
                                         }
