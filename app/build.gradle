@@ -12,21 +12,33 @@ android {
     defaultConfig {
         applicationId "com.adfree.zentube"
         minSdk 26
-        targetSdk 35
-        versionCode 1
-        versionName "1.0.0"
+        targetSdk 34
+        versionCode 3
+        versionName "1.0.2"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        release {
+            storeFile file("release.jks")
+            storePassword "zentube123"
+            keyAlias "zentube"
+            keyPassword "zentube123"
+            v1SigningEnabled true
+            v2SigningEnabled true
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
         debug {
             minifyEnabled false
+            signingConfig signingConfigs.release
         }
     }
     compileOptions {
