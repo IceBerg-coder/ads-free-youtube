@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.5"
+        android:scaleY="0.5"
+        android:translateX="27"
+        android:translateY="27">
+        <!-- Shield Background -->
+        <path
+            android:fillColor="#FF0033"
+            android:pathData="M54,12 L84,24 C84,54 70,76 54,84 C38,76 24,54 24,24 Z" />
+        <!-- Play Button -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M48,36 L66,48 L48,60 Z" />
+    </group>
+</vector>
