@@ -22,7 +22,10 @@
 - 📱 **Picture-in-Picture (PiP):**
   - Seamless native Android PiP mode (`Rational(16, 9)`). Watch videos in a floating window while multitasking or using other apps.
 - 🎵 **Background Audio Playback:**
-  - Continuous audio stream that persists when locking the screen or switching between apps.
+  - Continuous audio stream that persists when locking the screen or switching between apps, powered by a foreground playback service with an Android MediaSession.
+  - Media notification and lock-screen controls (play/pause, stop, seek) that stay in sync with the player.
+- ⏯️ **In-App Playback Controls:**
+  - Floating control bar with play/pause, ±10 second seek, a progress slider with time labels, and playback speed from 0.25× to 2×.
 - 🌙 **AMOLED Pure Black Theme:**
   - Designed for OLED/AMOLED displays to reduce eye strain and maximize battery efficiency.
 - 🖥️ **Desktop Mode Toggle:**

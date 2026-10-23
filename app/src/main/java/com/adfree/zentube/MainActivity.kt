@@ -1,9 +1,11 @@
 package com.adfree.zentube
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.PictureInPictureParams
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.net.Uri
@@ -22,6 +24,8 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -52,6 +56,11 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.adfree.zentube.adblock.AdBlockEngine
 import com.adfree.zentube.adblock.ZenTubeBridge
+import com.adfree.zentube.playback.PlaybackController
+import com.adfree.zentube.playback.PlaybackReporter
+import com.adfree.zentube.playback.PlaybackService
+import com.adfree.zentube.playback.PlaybackState
+import com.adfree.zentube.playback.ZenTubePlaybackBridge
 import com.adfree.zentube.ui.theme.*
 
 class MainActivity : ComponentActivity() {
@@ -65,6 +74,14 @@ class MainActivity : ComponentActivity() {
     private var isAmoledDark = mutableStateOf(true)
     private var isDesktopMode = mutableStateOf(false)
 
+    // Playback state, fed by the ZenTubePlayback JS bridge
+    private var hasMediaState = mutableStateOf(false)
+    private var isPlayingState = mutableStateOf(false)
+    private var playbackTitleState = mutableStateOf("")
+    private var playbackPositionState = mutableStateOf(0.0)
+    private var playbackDurationState = mutableStateOf(0.0)
+    private var playbackSpeedState = mutableFloatStateOf(1.0f)
+
     private val mobileUserAgent: String by lazy {
         WebSettings.getDefaultUserAgent(this)
     }
@@ -74,12 +91,99 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Let the playback service / media session drive the WebView's video
+        PlaybackState.controller = object : PlaybackController {
+            override fun play() = runOnUiThread {
+                webView?.evaluateJavascript(PlaybackReporter.playScript(), null)
+            }
+
+            override fun pause() = runOnUiThread {
+                webView?.evaluateJavascript(PlaybackReporter.pauseScript(), null)
+            }
+
+            override fun seekTo(positionSeconds: Double) = runOnUiThread {
+                webView?.evaluateJavascript(PlaybackReporter.seekToScript(positionSeconds), null)
+            }
+
+            override fun seekBy(deltaSeconds: Double) = runOnUiThread {
+                webView?.evaluateJavascript(PlaybackReporter.seekByScript(deltaSeconds), null)
+            }
+
+            override fun setSpeed(rate: Float) = runOnUiThread {
+                webView?.evaluateJavascript(PlaybackReporter.setSpeedScript(rate), null)
+            }
+        }
+
         val targetUrl = intent?.data?.toString() ?: "https://m.youtube.com"
 
         setContent {
             ZenTubeTheme {
                 MainScreen(initialUrl = targetUrl)
             }
+        }
+    }
+
+    override fun onDestroy() {
+        PlaybackState.controller = null
+        PlaybackService.stop(this)
+        super.onDestroy()
+    }
+
+    /**
+     * Receives playback state from the ZenTubePlayback JS bridge (already on
+     * the UI thread) and keeps the Compose UI, the shared PlaybackState, and
+     * the foreground playback service in sync.
+     */
+    private fun onPlaybackStateChanged(
+        hasMedia: Boolean,
+        isPlaying: Boolean,
+        positionSeconds: Double,
+        durationSeconds: Double,
+        speed: Float,
+        title: String
+    ) {
+        val significantChange = hasMedia != hasMediaState.value ||
+            isPlaying != isPlayingState.value ||
+            (title.isNotBlank() && title != playbackTitleState.value)
+
+        hasMediaState.value = hasMedia
+        isPlayingState.value = isPlaying
+        playbackPositionState.value = positionSeconds
+        playbackDurationState.value = durationSeconds
+        playbackSpeedState.value = speed
+        if (title.isNotBlank()) playbackTitleState.value = title
+
+        PlaybackState.hasMedia = hasMedia
+        PlaybackState.isPlaying = isPlaying
+        PlaybackState.positionSeconds = positionSeconds
+        PlaybackState.durationSeconds = durationSeconds
+        PlaybackState.speed = speed
+        if (title.isNotBlank()) PlaybackState.title = title
+
+        if (hasMedia) {
+            if (!PlaybackState.serviceRunning) {
+                ensureNotificationPermission()
+                PlaybackService.start(this)
+            } else if (significantChange) {
+                // MediaSession extrapolates position from speed while playing,
+                // so only structural changes need a service refresh.
+                PlaybackService.refresh(this)
+            }
+        } else if (PlaybackState.serviceRunning) {
+            PlaybackService.stop(this)
+        }
+    }
+
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                REQUEST_POST_NOTIFICATIONS
+            )
         }
     }
 
@@ -440,12 +544,32 @@ class MainActivity : ComponentActivity() {
                                     },
                                     "ZenTubeBridge"
                                 )
+                                addJavascriptInterface(
+                                    ZenTubePlaybackBridge { hasMedia, isPlaying, position, duration, speed, title ->
+                                        runOnUiThread {
+                                            onPlaybackStateChanged(
+                                                hasMedia,
+                                                isPlaying,
+                                                position,
+                                                duration,
+                                                speed,
+                                                title
+                                            )
+                                        }
+                                    },
+                                    "ZenTubePlayback"
+                                )
 
                                 try {
                                     if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                                         WebViewCompat.addDocumentStartJavaScript(
                                             this,
                                             AdBlockEngine.ADBLOCK_INJECTION_SCRIPT,
+                                            setOf("*")
+                                        )
+                                        WebViewCompat.addDocumentStartJavaScript(
+                                            this,
+                                            PlaybackReporter.REPORT_SCRIPT,
                                             setOf("*")
                                         )
                                     }
@@ -472,6 +596,7 @@ class MainActivity : ComponentActivity() {
                                         if (isAdBlockEnabled.value) {
                                             view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
                                         }
+                                        view?.evaluateJavascript(PlaybackReporter.REPORT_SCRIPT, null)
                                     }
 
                                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -481,6 +606,7 @@ class MainActivity : ComponentActivity() {
                                         if (isAdBlockEnabled.value) {
                                             view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
                                         }
+                                        view?.evaluateJavascript(PlaybackReporter.REPORT_SCRIPT, null)
                                     }
 
                                     override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
@@ -489,6 +615,7 @@ class MainActivity : ComponentActivity() {
                                         if (isAdBlockEnabled.value) {
                                             view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
                                         }
+                                        view?.evaluateJavascript(PlaybackReporter.REPORT_SCRIPT, null)
                                     }
                                 }
 
@@ -497,6 +624,9 @@ class MainActivity : ComponentActivity() {
                                         pageProgress = newProgress / 100f
                                         if (newProgress in 20..90 && isAdBlockEnabled.value) {
                                             view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
+                                        }
+                                        if (newProgress in 20..90) {
+                                            view?.evaluateJavascript(PlaybackReporter.REPORT_SCRIPT, null)
                                         }
                                         if (newProgress >= 100) {
                                             isPageLoading = false
@@ -515,6 +645,11 @@ class MainActivity : ComponentActivity() {
                                 loadUrl(initialUrl)
                             }
                         }
+                    )
+
+                    // In-app playback controls, shown while a video is present
+                    PlaybackControlsOverlay(
+                        modifier = Modifier.align(Alignment.BottomCenter)
                     )
                 }
             }
@@ -661,6 +796,174 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Floating in-app playback controls: play/pause, +/-10s seek, a seek
+     * slider, and a playback-speed selector, all driving the WebView's
+     * video element through the shared PlaybackController.
+     */
+    @Composable
+    fun PlaybackControlsOverlay(modifier: Modifier = Modifier) {
+        var speedMenuExpanded by remember { mutableStateOf(false) }
+        var scrubPosition by remember { mutableStateOf<Double?>(null) }
+        val duration = playbackDurationState.value
+        val displayPosition = scrubPosition ?: playbackPositionState.value
+        val showControls = hasMediaState.value && !isPipModeState.value && customView == null
+
+        AnimatedVisibility(visible = showControls, modifier = modifier) {
+            Surface(
+                color = DarkCard.copy(alpha = 0.94f),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                    if (playbackTitleState.value.isNotBlank()) {
+                        Text(
+                            text = playbackTitleState.value,
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (duration > 0) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = formatPlaybackTime(displayPosition),
+                                color = TextSecondary,
+                                fontSize = 11.sp
+                            )
+                            Slider(
+                                value = displayPosition.toFloat(),
+                                onValueChange = { scrubPosition = it.toDouble() },
+                                onValueChangeFinished = {
+                                    scrubPosition?.let { target ->
+                                        PlaybackState.controller?.seekTo(target)
+                                    }
+                                    scrubPosition = null
+                                },
+                                valueRange = 0f..duration.toFloat(),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(horizontal = 8.dp),
+                                colors = SliderDefaults.colors(
+                                    thumbColor = RedPrimary,
+                                    activeTrackColor = RedPrimary,
+                                    inactiveTrackColor = DarkCardElevated
+                                )
+                            )
+                            Text(
+                                text = formatPlaybackTime(duration),
+                                color = TextSecondary,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = { PlaybackState.controller?.seekBy(-10.0) }) {
+                            Icon(
+                                Icons.Filled.Replay10,
+                                contentDescription = "Back 10 seconds",
+                                tint = Color.White
+                            )
+                        }
+                        IconButton(
+                            onClick = {
+                                if (isPlayingState.value) {
+                                    PlaybackState.controller?.pause()
+                                } else {
+                                    PlaybackState.controller?.play()
+                                }
+                            },
+                            modifier = Modifier.size(52.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isPlayingState.value) {
+                                    Icons.Filled.Pause
+                                } else {
+                                    Icons.Filled.PlayArrow
+                                },
+                                contentDescription = if (isPlayingState.value) "Pause" else "Play",
+                                tint = Color.White,
+                                modifier = Modifier.size(32.dp)
+                            )
+                        }
+                        IconButton(onClick = { PlaybackState.controller?.seekBy(10.0) }) {
+                            Icon(
+                                Icons.Filled.Forward10,
+                                contentDescription = "Forward 10 seconds",
+                                tint = Color.White
+                            )
+                        }
+                        Box {
+                            TextButton(onClick = { speedMenuExpanded = true }) {
+                                Text(
+                                    text = "${formatSpeed(playbackSpeedState.floatValue)}×",
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = speedMenuExpanded,
+                                onDismissRequest = { speedMenuExpanded = false }
+                            ) {
+                                PLAYBACK_SPEEDS.forEach { rate ->
+                                    DropdownMenuItem(
+                                        text = { Text("${formatSpeed(rate)}×") },
+                                        onClick = {
+                                            PlaybackState.controller?.setSpeed(rate)
+                                            speedMenuExpanded = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                        IconButton(onClick = {
+                            webView?.evaluateJavascript(
+                                PlaybackReporter.requestFullscreenScript(),
+                                null
+                            )
+                        }) {
+                            Icon(
+                                Icons.Filled.Fullscreen,
+                                contentDescription = "Fullscreen",
+                                tint = Color.White
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun formatPlaybackTime(totalSeconds: Double): String {
+        val total = totalSeconds.toInt().coerceAtLeast(0)
+        val hours = total / 3600
+        val minutes = (total % 3600) / 60
+        val seconds = total % 60
+        return if (hours > 0) {
+            "%d:%02d:%02d".format(hours, minutes, seconds)
+        } else {
+            "%d:%02d".format(minutes, seconds)
+        }
+    }
+
+    private fun formatSpeed(rate: Float): String =
+        if (rate % 1.0f == 0.0f) rate.toInt().toString() else rate.toString()
+
+    companion object {
+        private const val REQUEST_POST_NOTIFICATIONS = 1001
+        private val PLAYBACK_SPEEDS =
+            listOf(0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
