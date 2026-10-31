@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState as MediaPlaybackState
@@ -15,6 +16,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.os.Bundle
 import com.adfree.zentube.MainActivity
 import com.adfree.zentube.R
 
@@ -53,6 +56,7 @@ object PlaybackState {
 class PlaybackService : Service() {
 
     private var mediaSession: MediaSession? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -83,6 +87,10 @@ class PlaybackService : Service() {
                 override fun onFastForward() {
                     PlaybackState.controller?.seekBy(SEEK_STEP_SECONDS)
                 }
+
+                override fun onCustomAction(action: String, extras: Bundle?) {
+                    if (action == ACTION_SPEED) cycleSpeed()
+                }
             }, Handler(Looper.getMainLooper()))
             isActive = true
         }
@@ -100,6 +108,7 @@ class PlaybackService : Service() {
             ACTION_PAUSE -> PlaybackState.controller?.pause()
             ACTION_REWIND -> PlaybackState.controller?.seekBy(-SEEK_STEP_SECONDS)
             ACTION_FORWARD -> PlaybackState.controller?.seekBy(SEEK_STEP_SECONDS)
+            ACTION_SPEED -> cycleSpeed()
             ACTION_STOP -> {
                 PlaybackState.controller?.pause()
                 stopPlayback()
@@ -128,7 +137,31 @@ class PlaybackService : Service() {
         }
     }
 
+    /** Step to the next playback speed, wrapping around after the fastest. */
+    private fun cycleSpeed() {
+        val current = PlaybackState.speed
+        val next = SPEED_STEPS.firstOrNull { it > current + 0.01f } ?: SPEED_STEPS.first()
+        PlaybackState.controller?.setSpeed(next)
+    }
+
+    /**
+     * Keep the CPU awake while audio plays with the screen off. Held only
+     * during playback and with a timeout, so a stuck state cannot drain the battery.
+     */
+    private fun updateWakeLock(playing: Boolean) {
+        if (playing) {
+            val lock = wakeLock ?: (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ZenTube:playback")
+                .apply { setReferenceCounted(false) }
+                .also { wakeLock = it }
+            lock.acquire(WAKE_LOCK_TIMEOUT_MS)
+        } else {
+            wakeLock?.takeIf { it.isHeld }?.release()
+        }
+    }
+
     override fun onDestroy() {
+        updateWakeLock(false)
         PlaybackState.serviceRunning = false
         mediaSession?.isActive = false
         mediaSession?.release()
@@ -207,6 +240,12 @@ class PlaybackService : Service() {
             ).build()
         }
 
+        val speedAction = Notification.Action.Builder(
+            Icon.createWithResource(this, R.drawable.ic_speed),
+            speedLabel(),
+            servicePendingIntent(ACTION_SPEED)
+        ).build()
+
         val stopAction = Notification.Action.Builder(
             android.R.drawable.ic_menu_close_clear_cancel,
             "Stop",
@@ -224,6 +263,7 @@ class PlaybackService : Service() {
             .addAction(rewindAction)
             .addAction(toggleAction)
             .addAction(forwardAction)
+            .addAction(speedAction)
             .addAction(stopAction)
             .setStyle(
                 Notification.MediaStyle()
@@ -264,6 +304,7 @@ class PlaybackService : Service() {
                         MediaPlaybackState.ACTION_FAST_FORWARD or
                         MediaPlaybackState.ACTION_STOP
                 )
+                .addCustomAction(ACTION_SPEED, speedLabel(), R.drawable.ic_speed)
                 .setState(
                     state,
                     (PlaybackState.positionSeconds * 1000).toLong(),
@@ -271,6 +312,14 @@ class PlaybackService : Service() {
                 )
                 .build()
         )
+        updateWakeLock(PlaybackState.isPlaying)
+    }
+
+    /** Current speed as a label such as "1×" or "1.25×". */
+    private fun speedLabel(): String {
+        val speed = PlaybackState.speed
+        val text = if (speed % 1.0f == 0.0f) speed.toInt().toString() else speed.toString()
+        return "$text×"
     }
 
     companion object {
@@ -282,9 +331,12 @@ class PlaybackService : Service() {
         const val ACTION_STOP = "com.adfree.zentube.playback.STOP"
         const val ACTION_REWIND = "com.adfree.zentube.playback.REWIND"
         const val ACTION_FORWARD = "com.adfree.zentube.playback.FORWARD"
+        const val ACTION_SPEED = "com.adfree.zentube.playback.SPEED"
         const val ACTION_UPDATE = "com.adfree.zentube.playback.UPDATE"
 
         private const val SEEK_STEP_SECONDS = 10.0
+        private val SPEED_STEPS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+        private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
 
         /** Start the foreground playback service (or refresh it if running). */
         fun start(context: Context) {

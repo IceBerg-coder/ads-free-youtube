@@ -15,6 +15,27 @@ object PlaybackReporter {
             if (window.__zentube_playback_installed) { return; }
             window.__zentube_playback_installed = true;
 
+            // Background playback: the player pauses itself when the page reports
+            // that it is hidden (app in background, screen off). Present the page
+            // as always visible and swallow visibility events. This runs at
+            // document start, before the page's own scripts register listeners.
+            try {
+                var visible = function() { return false; };
+                Object.defineProperty(Document.prototype, 'hidden',
+                    { configurable: true, get: visible });
+                Object.defineProperty(Document.prototype, 'webkitHidden',
+                    { configurable: true, get: visible });
+                Object.defineProperty(Document.prototype, 'visibilityState',
+                    { configurable: true, get: function() { return 'visible'; } });
+                Object.defineProperty(Document.prototype, 'webkitVisibilityState',
+                    { configurable: true, get: function() { return 'visible'; } });
+                ['visibilitychange', 'webkitvisibilitychange'].forEach(function(type) {
+                    window.addEventListener(type, function(e) {
+                        e.stopImmediatePropagation();
+                    }, true);
+                });
+            } catch (e) {}
+
             function cleanTitle(t) {
                 return (t || '')
                     .replace(/^\(\d+\)\s*/, '')

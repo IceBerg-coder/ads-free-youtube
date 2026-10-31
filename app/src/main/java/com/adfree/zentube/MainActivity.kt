@@ -50,6 +50,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -899,10 +900,15 @@ class MainActivity : ComponentActivity() {
     fun PlaybackControlsOverlay(modifier: Modifier = Modifier) {
         var speedMenuExpanded by remember { mutableStateOf(false) }
         var scrubPosition by remember { mutableStateOf<Double?>(null) }
+        var collapsed by remember { mutableStateOf(false) }
         val duration = playbackDurationState.value
         val displayPosition = scrubPosition ?: playbackPositionState.value
+        // In landscape the page's own player fills the screen and has its own
+        // controls; the overlay would cover them.
+        val isLandscape =
+            LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
         val showControls = hasMediaState.value && isWatchPageState.value &&
-            !isPipModeState.value && customView == null
+            !isPipModeState.value && customView == null && !isLandscape
 
         AnimatedVisibility(visible = showControls, modifier = modifier) {
             Surface(
@@ -913,17 +919,54 @@ class MainActivity : ComponentActivity() {
                     .padding(horizontal = 12.dp, vertical = 8.dp)
             ) {
                 Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                    if (playbackTitleState.value.isNotBlank()) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = playbackTitleState.value,
+                            text = playbackTitleState.value.ifBlank { "ZenTube" },
                             color = Color.White,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
                         )
+                        if (collapsed) {
+                            IconButton(
+                                onClick = {
+                                    if (isPlayingState.value) {
+                                        PlaybackState.controller?.pause()
+                                    } else {
+                                        PlaybackState.controller?.play()
+                                    }
+                                },
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (isPlayingState.value) {
+                                        Icons.Filled.Pause
+                                    } else {
+                                        Icons.Filled.PlayArrow
+                                    },
+                                    contentDescription = if (isPlayingState.value) "Pause" else "Play",
+                                    tint = Color.White
+                                )
+                            }
+                        }
+                        IconButton(
+                            onClick = { collapsed = !collapsed },
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (collapsed) {
+                                    Icons.Filled.KeyboardArrowUp
+                                } else {
+                                    Icons.Filled.KeyboardArrowDown
+                                },
+                                contentDescription = if (collapsed) "Expand controls" else "Collapse controls",
+                                tint = Color.White
+                            )
+                        }
                     }
-                    if (duration > 0) {
+                    if (!collapsed && duration > 0) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 text = formatPlaybackTime(displayPosition),
@@ -956,7 +999,7 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     }
-                    Row(
+                    if (!collapsed) Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
