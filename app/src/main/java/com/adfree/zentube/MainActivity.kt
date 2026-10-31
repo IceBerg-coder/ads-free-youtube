@@ -11,6 +11,9 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Rational
 import android.view.View
 import android.view.ViewGroup
@@ -62,6 +65,8 @@ import com.adfree.zentube.playback.PlaybackService
 import com.adfree.zentube.playback.PlaybackState
 import com.adfree.zentube.playback.ZenTubePlaybackBridge
 import com.adfree.zentube.ui.theme.*
+import java.util.Locale
+import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
 
@@ -81,6 +86,15 @@ class MainActivity : ComponentActivity() {
     private var playbackPositionState = mutableStateOf(0.0)
     private var playbackDurationState = mutableStateOf(0.0)
     private var playbackSpeedState = mutableFloatStateOf(1.0f)
+
+    // True while the WebView is on a /watch or /live page (drives the overlay)
+    private var isWatchPageState = mutableStateOf(false)
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val noMediaRunnable = Runnable { applyNoMedia() }
+    private var noMediaPending = false
+    private var lastReportElapsedMs = 0L
+    private var notificationPermissionRequested = false
 
     private val mobileUserAgent: String by lazy {
         WebSettings.getDefaultUserAgent(this)
@@ -124,6 +138,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(noMediaRunnable)
         PlaybackState.controller = null
         PlaybackService.stop(this)
         super.onDestroy()
@@ -142,7 +157,40 @@ class MainActivity : ComponentActivity() {
         speed: Float,
         title: String
     ) {
-        val significantChange = hasMedia != hasMediaState.value ||
+        if (!hasMedia) {
+            // The <video> element briefly has no usable media between videos
+            // (autoplay next, source swaps). Keep the last state for a grace
+            // period so the service is not torn down and restarted, which can
+            // be blocked while the app is in the background.
+            if (hasMediaState.value && !noMediaPending) {
+                noMediaPending = true
+                mainHandler.postDelayed(noMediaRunnable, NO_MEDIA_GRACE_MS)
+            }
+            return
+        }
+        if (noMediaPending) {
+            noMediaPending = false
+            mainHandler.removeCallbacks(noMediaRunnable)
+        }
+
+        // Compare against where the media session would have extrapolated to,
+        // so seeks and speed changes also refresh the notification and session.
+        val now = SystemClock.elapsedRealtime()
+        val expectedPosition = if (isPlayingState.value) {
+            playbackPositionState.value +
+                (now - lastReportElapsedMs) / 1000.0 * playbackSpeedState.floatValue
+        } else {
+            playbackPositionState.value
+        }
+        val sessionStale = hasMediaState.value && (
+            abs(positionSeconds - expectedPosition) > SEEK_JUMP_SECONDS ||
+                speed != playbackSpeedState.floatValue ||
+                abs(durationSeconds - playbackDurationState.value) > 0.5
+            )
+        lastReportElapsedMs = now
+
+        val significantChange = sessionStale ||
+            hasMedia != hasMediaState.value ||
             isPlaying != isPlayingState.value ||
             (title.isNotBlank() && title != playbackTitleState.value)
 
@@ -160,21 +208,38 @@ class MainActivity : ComponentActivity() {
         PlaybackState.speed = speed
         if (title.isNotBlank()) PlaybackState.title = title
 
-        if (hasMedia) {
-            if (!PlaybackState.serviceRunning) {
-                ensureNotificationPermission()
-                PlaybackService.start(this)
-            } else if (significantChange) {
-                // MediaSession extrapolates position from speed while playing,
-                // so only structural changes need a service refresh.
-                PlaybackService.refresh(this)
-            }
-        } else if (PlaybackState.serviceRunning) {
+        if (!PlaybackState.serviceRunning) {
+            ensureNotificationPermission()
+            PlaybackService.start(this)
+        } else if (significantChange) {
+            // MediaSession extrapolates position from speed while playing, so
+            // only structural changes, seeks and speed changes need a refresh.
+            PlaybackService.refresh(this)
+        }
+    }
+
+    /** Called once the no-media grace period has elapsed without media returning. */
+    private fun applyNoMedia() {
+        noMediaPending = false
+        hasMediaState.value = false
+        isPlayingState.value = false
+        playbackPositionState.value = 0.0
+        playbackDurationState.value = 0.0
+        PlaybackState.hasMedia = false
+        PlaybackState.isPlaying = false
+        PlaybackState.positionSeconds = 0.0
+        PlaybackState.durationSeconds = 0.0
+        if (PlaybackState.serviceRunning) {
             PlaybackService.stop(this)
         }
     }
 
     private fun ensureNotificationPermission() {
+        // Ask at most once per activity instance; the result is not needed
+        // because the foreground service runs either way (only the
+        // notification is hidden when the permission is denied).
+        if (notificationPermissionRequested) return
+        notificationPermissionRequested = true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
@@ -196,8 +261,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        val currentUrl = webView?.url ?: ""
-        if (currentUrl.contains("watch") || customView != null) {
+        // Only auto-enter PiP when a video is actually playing; otherwise the
+        // user just wants to leave the app.
+        val videoPlaying = PlaybackState.hasMedia && PlaybackState.isPlaying
+        if (videoPlaying && (isWatchPageState.value || customView != null)) {
             triggerPipMode()
         }
     }
@@ -208,19 +275,42 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         isPipModeState.value = isInPictureInPictureMode
+        // Keep the page layout in sync with the PiP state (also covers the
+        // user closing or expanding the PiP window).
+        setPagePipLayout(isInPictureInPictureMode)
     }
 
     private fun triggerPipMode() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            try {
+            // Make the page render only the player, unless the video is already
+            // in the native fullscreen custom view.
+            if (customView == null) setPagePipLayout(true)
+            val entered = try {
                 val params = PictureInPictureParams.Builder()
                     .setAspectRatio(Rational(16, 9))
                     .build()
                 enterPictureInPictureMode(params)
             } catch (e: Exception) {
-                // Device may not support aspect ratio
+                // Device may not support PiP or the aspect ratio
+                false
             }
+            if (!entered && !isInPictureInPictureMode) setPagePipLayout(false)
         }
+    }
+
+    private fun setPagePipLayout(enabled: Boolean) {
+        webView?.evaluateJavascript(PlaybackReporter.pipScript(enabled), null)
+    }
+
+    /** True for pages that show a player the overlay can control. */
+    private fun isWatchUrl(url: String?): Boolean {
+        val path = try {
+            Uri.parse(url ?: return false).path ?: return false
+        } catch (e: Exception) {
+            return false
+        }
+        return path == "/watch" || path.startsWith("/watch/") ||
+            path == "/live" || path.startsWith("/live/")
     }
 
     @OptIn(ExperimentalMaterial3Api::class)
@@ -593,6 +683,7 @@ class MainActivity : ComponentActivity() {
                                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                         super.onPageStarted(view, url, favicon)
                                         isPageLoading = true
+                                        isWatchPageState.value = isWatchUrl(url)
                                         if (isAdBlockEnabled.value) {
                                             view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
                                         }
@@ -611,6 +702,7 @@ class MainActivity : ComponentActivity() {
 
                                     override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                                         super.doUpdateVisitedHistory(view, url, isReload)
+                                        isWatchPageState.value = isWatchUrl(url)
                                         canGoBack = view?.canGoBack() == true
                                         if (isAdBlockEnabled.value) {
                                             view?.evaluateJavascript(AdBlockEngine.ADBLOCK_INJECTION_SCRIPT, null)
@@ -809,7 +901,8 @@ class MainActivity : ComponentActivity() {
         var scrubPosition by remember { mutableStateOf<Double?>(null) }
         val duration = playbackDurationState.value
         val displayPosition = scrubPosition ?: playbackPositionState.value
-        val showControls = hasMediaState.value && !isPipModeState.value && customView == null
+        val showControls = hasMediaState.value && isWatchPageState.value &&
+            !isPipModeState.value && customView == null
 
         AnimatedVisibility(visible = showControls, modifier = modifier) {
             Surface(
@@ -951,9 +1044,9 @@ class MainActivity : ComponentActivity() {
         val minutes = (total % 3600) / 60
         val seconds = total % 60
         return if (hours > 0) {
-            "%d:%02d:%02d".format(hours, minutes, seconds)
+            String.format(Locale.ROOT, "%d:%02d:%02d", hours, minutes, seconds)
         } else {
-            "%d:%02d".format(minutes, seconds)
+            String.format(Locale.ROOT, "%d:%02d", minutes, seconds)
         }
     }
 
@@ -962,6 +1055,12 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val REQUEST_POST_NOTIFICATIONS = 1001
+
+        /** How long "no media" is tolerated before the playback service stops. */
+        private const val NO_MEDIA_GRACE_MS = 2500L
+
+        /** Position drift (seconds) beyond extrapolation that counts as a seek. */
+        private const val SEEK_JUMP_SECONDS = 2.0
         private val PLAYBACK_SPEEDS =
             listOf(0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     }

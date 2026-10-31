@@ -75,15 +75,31 @@ class PlaybackService : Service() {
                 override fun onSeekTo(pos: Long) {
                     PlaybackState.controller?.seekTo(pos / 1000.0)
                 }
+
+                override fun onRewind() {
+                    PlaybackState.controller?.seekBy(-SEEK_STEP_SECONDS)
+                }
+
+                override fun onFastForward() {
+                    PlaybackState.controller?.seekBy(SEEK_STEP_SECONDS)
+                }
             }, Handler(Looper.getMainLooper()))
             isActive = true
         }
+        // Enter the foreground right away. A service started with
+        // startForegroundService() must call startForeground() promptly, even
+        // if it is stopped again before onStartCommand() runs.
+        PlaybackState.serviceRunning = true
+        promoteToForeground()
+        syncMediaSession()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_PLAY -> PlaybackState.controller?.play()
             ACTION_PAUSE -> PlaybackState.controller?.pause()
+            ACTION_REWIND -> PlaybackState.controller?.seekBy(-SEEK_STEP_SECONDS)
+            ACTION_FORWARD -> PlaybackState.controller?.seekBy(SEEK_STEP_SECONDS)
             ACTION_STOP -> {
                 PlaybackState.controller?.pause()
                 stopPlayback()
@@ -92,6 +108,14 @@ class PlaybackService : Service() {
         }
         // ACTION_UPDATE (and any start) falls through: (re)post the notification.
         PlaybackState.serviceRunning = true
+        promoteToForeground()
+        syncMediaSession()
+        // Not sticky: if the process dies there is no activity or WebView left
+        // to control, so a restarted service would only leave an orphan notification.
+        return START_NOT_STICKY
+    }
+
+    private fun promoteToForeground() {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -102,8 +126,6 @@ class PlaybackService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        syncMediaSession()
-        return START_STICKY
     }
 
     override fun onDestroy() {
@@ -159,6 +181,18 @@ class PlaybackService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val rewindAction = Notification.Action.Builder(
+            android.R.drawable.ic_media_rew,
+            "Back 10 seconds",
+            servicePendingIntent(ACTION_REWIND)
+        ).build()
+
+        val forwardAction = Notification.Action.Builder(
+            android.R.drawable.ic_media_ff,
+            "Forward 10 seconds",
+            servicePendingIntent(ACTION_FORWARD)
+        ).build()
+
         val toggleAction = if (isPlaying) {
             Notification.Action.Builder(
                 android.R.drawable.ic_media_pause,
@@ -187,30 +221,33 @@ class PlaybackService : Service() {
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setOngoing(isPlaying)
             .setShowWhen(false)
+            .addAction(rewindAction)
             .addAction(toggleAction)
+            .addAction(forwardAction)
             .addAction(stopAction)
             .setStyle(
                 Notification.MediaStyle()
                     .setMediaSession(mediaSession?.sessionToken)
-                    .setShowActionsInCompactView(0)
+                    .setShowActionsInCompactView(0, 1, 2)
             )
             .build()
     }
 
     private fun syncMediaSession() {
         val session = mediaSession ?: return
-        session.setMetadata(
-            MediaMetadata.Builder()
-                .putString(
-                    MediaMetadata.METADATA_KEY_TITLE,
-                    PlaybackState.title.ifBlank { "ZenTube" }
-                )
-                .putLong(
-                    MediaMetadata.METADATA_KEY_DURATION,
-                    (PlaybackState.durationSeconds * 1000).toLong()
-                )
-                .build()
-        )
+        val metadata = MediaMetadata.Builder()
+            .putString(
+                MediaMetadata.METADATA_KEY_TITLE,
+                PlaybackState.title.ifBlank { "ZenTube" }
+            )
+        // Live streams report no duration; leave it unset instead of claiming 0.
+        if (PlaybackState.durationSeconds > 0) {
+            metadata.putLong(
+                MediaMetadata.METADATA_KEY_DURATION,
+                (PlaybackState.durationSeconds * 1000).toLong()
+            )
+        }
+        session.setMetadata(metadata.build())
         val state = if (PlaybackState.isPlaying) {
             MediaPlaybackState.STATE_PLAYING
         } else {
@@ -223,6 +260,8 @@ class PlaybackService : Service() {
                         MediaPlaybackState.ACTION_PAUSE or
                         MediaPlaybackState.ACTION_PLAY_PAUSE or
                         MediaPlaybackState.ACTION_SEEK_TO or
+                        MediaPlaybackState.ACTION_REWIND or
+                        MediaPlaybackState.ACTION_FAST_FORWARD or
                         MediaPlaybackState.ACTION_STOP
                 )
                 .setState(
@@ -241,7 +280,11 @@ class PlaybackService : Service() {
         const val ACTION_PLAY = "com.adfree.zentube.playback.PLAY"
         const val ACTION_PAUSE = "com.adfree.zentube.playback.PAUSE"
         const val ACTION_STOP = "com.adfree.zentube.playback.STOP"
+        const val ACTION_REWIND = "com.adfree.zentube.playback.REWIND"
+        const val ACTION_FORWARD = "com.adfree.zentube.playback.FORWARD"
         const val ACTION_UPDATE = "com.adfree.zentube.playback.UPDATE"
+
+        private const val SEEK_STEP_SECONDS = 10.0
 
         /** Start the foreground playback service (or refresh it if running). */
         fun start(context: Context) {
@@ -258,9 +301,13 @@ class PlaybackService : Service() {
         /** Refresh notification + media session from the latest PlaybackState. */
         fun refresh(context: Context) {
             if (!PlaybackState.serviceRunning) return
-            val intent = Intent(context, PlaybackService::class.java)
-                .setAction(ACTION_UPDATE)
-            context.startService(intent)
+            try {
+                val intent = Intent(context, PlaybackService::class.java)
+                    .setAction(ACTION_UPDATE)
+                context.startService(intent)
+            } catch (e: IllegalStateException) {
+                // Background-start restriction; the next state change retries.
+            }
         }
 
         /** Stop the foreground playback service entirely. */
