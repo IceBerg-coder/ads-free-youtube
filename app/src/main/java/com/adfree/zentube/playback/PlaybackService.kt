@@ -46,6 +46,13 @@ object PlaybackState {
     @Volatile var speed: Float = 1.0f
     @Volatile var controller: PlaybackController? = null
     @Volatile var serviceRunning: Boolean = false
+
+    /**
+     * Set when the user dismisses playback from the notification or a media
+     * button. While set, MainActivity does not auto-restart the service; it is
+     * cleared when playback resumes or new media appears.
+     */
+    @Volatile var stoppedByUser: Boolean = false
 }
 
 /**
@@ -172,6 +179,7 @@ class PlaybackService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun stopPlayback() {
+        PlaybackState.stoppedByUser = true
         PlaybackState.serviceRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()

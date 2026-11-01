@@ -190,10 +190,19 @@ class MainActivity : ComponentActivity() {
             )
         lastReportElapsedMs = now
 
+        val titleChanged = title.isNotBlank() && title != playbackTitleState.value
         val significantChange = sessionStale ||
             hasMedia != hasMediaState.value ||
             isPlaying != isPlayingState.value ||
-            (title.isNotBlank() && title != playbackTitleState.value)
+            titleChanged
+
+        // After the user stopped playback, only a real resume (paused -> playing),
+        // new media or a new title may bring the service back. A late report
+        // that is still "playing" right after Stop must not clear the flag.
+        val resumedOrNewMedia = !hasMediaState.value ||
+            (isPlaying && !isPlayingState.value) ||
+            titleChanged
+        if (resumedOrNewMedia) PlaybackState.stoppedByUser = false
 
         hasMediaState.value = hasMedia
         isPlayingState.value = isPlaying
@@ -210,8 +219,10 @@ class MainActivity : ComponentActivity() {
         if (title.isNotBlank()) PlaybackState.title = title
 
         if (!PlaybackState.serviceRunning) {
-            ensureNotificationPermission()
-            PlaybackService.start(this)
+            if (!PlaybackState.stoppedByUser) {
+                ensureNotificationPermission()
+                PlaybackService.start(this)
+            }
         } else if (significantChange) {
             // MediaSession extrapolates position from speed while playing, so
             // only structural changes, seeks and speed changes need a refresh.
@@ -230,6 +241,8 @@ class MainActivity : ComponentActivity() {
         PlaybackState.isPlaying = false
         PlaybackState.positionSeconds = 0.0
         PlaybackState.durationSeconds = 0.0
+        // The media is gone; whatever plays next may start the service again.
+        PlaybackState.stoppedByUser = false
         if (PlaybackState.serviceRunning) {
             PlaybackService.stop(this)
         }
