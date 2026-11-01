@@ -337,6 +337,11 @@ object AdBlockEngine {
 
                     const video = document.querySelector('video');
                     if (video && isAdShowing) {
+                        // Remember the user's mute state and rate so they can be
+                        // restored once the ad is gone (the <video> element is shared).
+                        if (!window.__zentube_adState) {
+                            window.__zentube_adState = { muted: video.muted, rate: video.playbackRate || 1.0 };
+                        }
                         video.muted = true;
                         video.playbackRate = 16.0;
                         if (!isNaN(video.duration) && video.duration > 0) {
@@ -345,6 +350,12 @@ object AdBlockEngine {
                         if (window.ZenTubeBridge && typeof window.ZenTubeBridge.onAdBlocked === 'function') {
                             window.ZenTubeBridge.onAdBlocked();
                         }
+                    } else if (window.__zentube_adState) {
+                        if (video) {
+                            video.muted = window.__zentube_adState.muted;
+                            video.playbackRate = window.__zentube_adState.rate;
+                        }
+                        window.__zentube_adState = null;
                     }
 
                     // Auto-click Skip Button
