@@ -11,6 +11,8 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Rational
 import android.view.View
 import android.view.ViewGroup
@@ -82,6 +84,14 @@ class MainActivity : ComponentActivity() {
     private var playbackDurationState = mutableStateOf(0.0)
     private var playbackSpeedState = mutableFloatStateOf(1.0f)
 
+    // Hides of the mini-player bar are debounced: the JS reporter polls
+    // every 500ms and can briefly miss the video element (feed previews,
+    // ad swaps, autoplay-next), which used to hide and re-show the bar
+    // every other report. Only a sustained absence hides it.
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var noMediaPending = false
+    private val noMediaRunnable = Runnable { applyNoMedia() }
+
     private val mobileUserAgent: String by lazy {
         WebSettings.getDefaultUserAgent(this)
     }
@@ -124,6 +134,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(noMediaRunnable)
         PlaybackState.controller = null
         PlaybackService.stop(this)
         super.onDestroy()
@@ -146,14 +157,12 @@ class MainActivity : ComponentActivity() {
             isPlaying != isPlayingState.value ||
             (title.isNotBlank() && title != playbackTitleState.value)
 
-        hasMediaState.value = hasMedia
         isPlayingState.value = isPlaying
         playbackPositionState.value = positionSeconds
         playbackDurationState.value = durationSeconds
         playbackSpeedState.value = speed
         if (title.isNotBlank()) playbackTitleState.value = title
 
-        PlaybackState.hasMedia = hasMedia
         PlaybackState.isPlaying = isPlaying
         PlaybackState.positionSeconds = positionSeconds
         PlaybackState.durationSeconds = durationSeconds
@@ -161,6 +170,16 @@ class MainActivity : ComponentActivity() {
         if (title.isNotBlank()) PlaybackState.title = title
 
         if (hasMedia) {
+            // Media is back (or never left): cancel any pending hide and
+            // show the bar immediately.
+            if (noMediaPending) {
+                noMediaPending = false
+                mainHandler.removeCallbacks(noMediaRunnable)
+            }
+            if (!hasMediaState.value) {
+                hasMediaState.value = true
+                PlaybackState.hasMedia = true
+            }
             if (!PlaybackState.serviceRunning) {
                 ensureNotificationPermission()
                 PlaybackService.start(this)
@@ -169,7 +188,25 @@ class MainActivity : ComponentActivity() {
                 // so only structural changes need a service refresh.
                 PlaybackService.refresh(this)
             }
-        } else if (PlaybackState.serviceRunning) {
+        } else if (hasMediaState.value && !noMediaPending) {
+            // One "no media" report proves nothing: the reporter can miss
+            // the video for a report or two. Only hide the bar (and stop
+            // the service) after a sustained absence.
+            noMediaPending = true
+            mainHandler.postDelayed(noMediaRunnable, NO_MEDIA_GRACE_MS)
+        }
+    }
+
+    /**
+     * Runs [NO_MEDIA_GRACE_MS] after the first "no media" report, only if
+     * no media has shown up since. Hides the mini-player bar and stops
+     * the foreground playback service.
+     */
+    private fun applyNoMedia() {
+        noMediaPending = false
+        hasMediaState.value = false
+        PlaybackState.hasMedia = false
+        if (PlaybackState.serviceRunning) {
             PlaybackService.stop(this)
         }
     }
@@ -962,6 +999,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val REQUEST_POST_NOTIFICATIONS = 1001
+        private const val NO_MEDIA_GRACE_MS = 2500L
         private val PLAYBACK_SPEEDS =
             listOf(0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     }
