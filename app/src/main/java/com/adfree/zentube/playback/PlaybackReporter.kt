@@ -22,10 +22,28 @@ object PlaybackReporter {
                     .trim();
             }
 
+            // The page can hold several <video> elements at once (feed previews,
+            // the mini-player, ads). The first one in DOM order is often a muted
+            // feed preview that appears and disappears while scrolling, which made
+            // the app flap between "media" and "no media" and flicker the
+            // mini-player bar. Always prefer the real player element, then any
+            // video that is actually playing, and only then the first video.
+            function findVideo() {
+                var v = document.querySelector('.html5-video-player video');
+                if (v) return v;
+                var videos = document.querySelectorAll('video');
+                for (var i = 0; i < videos.length; i++) {
+                    var c = videos[i];
+                    if (!c.paused && !c.ended && (c.currentTime || 0) > 0) return c;
+                }
+                return videos.length ? videos[0] : null;
+            }
+            window.__zentube_findVideo = findVideo;
+
             function report() {
                 try {
                     if (!window.ZenTubePlayback) { return; }
-                    var v = document.querySelector('video');
+                    var v = findVideo();
                     if (!v || v.readyState < 1 || !(v.duration > 0)) {
                         ZenTubePlayback.onPlaybackState(false, false, 0, 0, 1.0, '');
                         return;
@@ -51,22 +69,27 @@ object PlaybackReporter {
         })();
     """.trimIndent()
 
+    // Control scripts target the same video the reporter observes, so
+    // play/pause/seek never hit a stray feed-preview element.
+    private fun targetVideoExpr(): String =
+        "var f=window.__zentube_findVideo;var v=f?f():document.querySelector('video');"
+
     fun playScript(): String =
-        "(function(){var v=document.querySelector('video');if(v){v.play();}})();"
+        "(function(){" + targetVideoExpr() + "if(v){v.play();}})();"
 
     fun pauseScript(): String =
-        "(function(){var v=document.querySelector('video');if(v){v.pause();}})();"
+        "(function(){" + targetVideoExpr() + "if(v){v.pause();}})();"
 
     fun seekByScript(deltaSeconds: Double): String =
-        "(function(){var v=document.querySelector('video');" +
+        "(function(){" + targetVideoExpr() +
             "if(v){try{v.currentTime=Math.max(0,(v.currentTime||0)+($deltaSeconds));}catch(e){}}})();"
 
     fun seekToScript(positionSeconds: Double): String =
-        "(function(){var v=document.querySelector('video');" +
+        "(function(){" + targetVideoExpr() +
             "if(v){try{v.currentTime=Math.max(0,$positionSeconds);}catch(e){}}})();"
 
     fun setSpeedScript(rate: Float): String =
-        "(function(){var v=document.querySelector('video');if(v){v.playbackRate=$rate;}})();"
+        "(function(){" + targetVideoExpr() + "if(v){v.playbackRate=$rate;}})();"
 
     fun requestFullscreenScript(): String =
         "(function(){var p=document.querySelector('.html5-video-player');" +
